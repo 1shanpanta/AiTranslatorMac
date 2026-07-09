@@ -195,13 +195,14 @@ class Translator:
 
         self._thread = None
         self._loop = None
-        self._stop_event = None
+        self._stop_event = None       # asyncio.Event (network tasks)
+        self._stop_flag = None        # threading.Event (audio threads)
 
         self.session = None
-        self.out_queue = None
-        self.audio_in_queue = None
-        self.audio_in_stream = None
-        self.audio_out_stream = None
+        self.send_q = None            # captured mic audio -> sender task
+        self.play_q = None            # model audio -> playback thread
+        self._capture_thread = None
+        self._playback_thread = None
 
     # -- lifecycle (called from the Tk thread) --
 
@@ -210,6 +211,9 @@ class Translator:
         self._thread.start()
 
     def stop(self):
+        # Signal the audio threads first so they stop touching PortAudio ASAP.
+        if self._stop_flag is not None:
+            self._stop_flag.set()
         loop, stop_event = self._loop, self._stop_event
         if loop is None or stop_event is None or loop.is_closed():
             return
@@ -236,6 +240,9 @@ class Translator:
     async def _run(self):
         self._loop = asyncio.get_running_loop()
         self._stop_event = asyncio.Event()
+        self._stop_flag = threading.Event()
+        self.send_q = queue.Queue(maxsize=50)
+        self.play_q = queue.Queue(maxsize=100)
         self._emit("status", "Connecting…")
 
         client = genai.Client(
@@ -250,14 +257,21 @@ class Translator:
                 asyncio.TaskGroup() as tg,
             ):
                 self.session = session
-                self.out_queue = asyncio.Queue(maxsize=20)
-                self.audio_in_queue = asyncio.Queue()
 
-                tg.create_task(self._listen_audio())
+                # Audio I/O runs on dedicated OS threads that each own their
+                # PortAudio stream (open + read/write + close all on one
+                # thread). Nothing else ever touches a stream, so it's never
+                # closed mid-read — the race that segfaulted on stop.
+                self._capture_thread = threading.Thread(
+                    target=self._capture_loop, daemon=True)
+                self._capture_thread.start()
+                if self.play_audio:
+                    self._playback_thread = threading.Thread(
+                        target=self._playback_loop, daemon=True)
+                    self._playback_thread.start()
+
                 tg.create_task(self._send_realtime())
                 tg.create_task(self._receive())
-                if self.play_audio:
-                    tg.create_task(self._play_audio())
 
                 self._emit("status", "Listening…")
                 await self._stop_event.wait()
@@ -272,43 +286,52 @@ class Translator:
             self._cleanup()
             self._emit("status", "Stopped")
 
-    async def _listen_audio(self):
-        if self.mic_index is None:
-            self.mic_index = pya.get_default_input_device_info()["index"]
-
-        info = pya.get_device_info_by_index(self.mic_index)
-        # Try the format Gemini wants directly; many mics support it. Virtual
-        # devices (e.g. BlackHole) usually don't, so fall back to their native
-        # rate/channels and resample to 16 kHz mono before sending.
-        self._cap_rate = SEND_SAMPLE_RATE
-        self._cap_channels = CHANNELS
+    def _capture_loop(self):
+        """Owns the mic stream: open → read → close, all on this one thread."""
+        stream = None
+        cap_rate, cap_channels = SEND_SAMPLE_RATE, CHANNELS
         try:
-            self.audio_in_stream = await asyncio.to_thread(
-                pya.open,
-                format=FORMAT, channels=CHANNELS, rate=SEND_SAMPLE_RATE,
-                input=True, input_device_index=self.mic_index,
-                frames_per_buffer=CHUNK_SIZE,
-            )
-        except Exception:
-            self._cap_rate = int(info.get("defaultSampleRate", 48000)) or 48000
-            self._cap_channels = min(2, int(info.get("maxInputChannels", 1))) or 1
-            self.audio_in_stream = await asyncio.to_thread(
-                pya.open,
-                format=FORMAT, channels=self._cap_channels, rate=self._cap_rate,
-                input=True, input_device_index=self.mic_index,
-                frames_per_buffer=CHUNK_SIZE,
-            )
+            if self.mic_index is None:
+                self.mic_index = pya.get_default_input_device_info()["index"]
+            info = pya.get_device_info_by_index(self.mic_index)
+            # Try the format Gemini wants directly; virtual devices (BlackHole)
+            # often can't, so fall back to their native rate/channels and
+            # resample to 16 kHz mono before sending.
+            try:
+                stream = pya.open(
+                    format=FORMAT, channels=CHANNELS, rate=SEND_SAMPLE_RATE,
+                    input=True, input_device_index=self.mic_index,
+                    frames_per_buffer=CHUNK_SIZE)
+            except Exception:
+                cap_rate = int(info.get("defaultSampleRate", 48000)) or 48000
+                cap_channels = min(2, int(info.get("maxInputChannels", 1))) or 1
+                stream = pya.open(
+                    format=FORMAT, channels=cap_channels, rate=cap_rate,
+                    input=True, input_device_index=self.mic_index,
+                    frames_per_buffer=CHUNK_SIZE)
 
-        needs_convert = (
-            self._cap_rate != SEND_SAMPLE_RATE or self._cap_channels != CHANNELS
-        )
-        while not self._stop_event.is_set():
-            data = await asyncio.to_thread(
-                self.audio_in_stream.read, CHUNK_SIZE, exception_on_overflow=False
-            )
-            if needs_convert:
-                data = self._to_16k_mono(data, self._cap_rate, self._cap_channels)
-            await self.out_queue.put({"data": data, "mime_type": "audio/pcm"})
+            needs_convert = (cap_rate != SEND_SAMPLE_RATE
+                             or cap_channels != CHANNELS)
+            while not self._stop_flag.is_set():
+                try:
+                    data = stream.read(CHUNK_SIZE, exception_on_overflow=False)
+                except Exception:
+                    break
+                if needs_convert:
+                    data = self._to_16k_mono(data, cap_rate, cap_channels)
+                try:
+                    self.send_q.put(data, timeout=0.1)
+                except queue.Full:
+                    pass  # sender is behind; drop this chunk
+        except Exception as exc:
+            self._emit("error", str(exc))
+        finally:
+            if stream is not None:
+                try:
+                    stream.stop_stream()
+                    stream.close()
+                except Exception:
+                    pass
 
     @staticmethod
     def _to_16k_mono(data, src_rate, channels):
@@ -326,15 +349,21 @@ class Translator:
 
     async def _send_realtime(self):
         while not self._stop_event.is_set():
-            msg = await self.out_queue.get()
+            try:
+                data = await asyncio.to_thread(self.send_q.get, True, 0.2)
+            except queue.Empty:
+                continue
             if self.session is not None:
-                await self.session.send(input=msg)
+                await self.session.send_realtime_input(
+                    audio=types.Blob(data=data,
+                                     mime_type="audio/pcm;rate=16000"))
 
     async def _receive(self):
         while not self._stop_event.is_set():
             turn = self.session.receive()
             async for response in turn:
                 sc = response.server_content
+                got_transcript = False
                 if sc is not None:
                     original = sc.input_transcription
                     if original is not None and original.text:
@@ -342,40 +371,63 @@ class Translator:
                     translated = sc.output_transcription
                     if translated is not None and translated.text:
                         self._emit("translated", translated.text)
+                        got_transcript = True
                     if sc.turn_complete:
                         self._emit("turn_end")
-                # Fallback for TEXT-modality responses.
-                if response.text:
+                # Fallback for TEXT-modality responses. Only read response.text
+                # when there's no audio transcript — otherwise accessing it on
+                # an audio (inline_data) response logs a noisy warning.
+                if not got_transcript and not response.data and response.text:
                     self._emit("translated", response.text)
                 if self.play_audio and response.data:
-                    self.audio_in_queue.put_nowait(response.data)
+                    try:
+                        self.play_q.put_nowait(response.data)
+                    except queue.Full:
+                        pass
 
             # Drop any audio buffered past an interruption.
-            if self.audio_in_queue is not None:
-                while not self.audio_in_queue.empty():
-                    self.audio_in_queue.get_nowait()
+            if self.play_q is not None:
+                while not self.play_q.empty():
+                    try:
+                        self.play_q.get_nowait()
+                    except queue.Empty:
+                        break
 
-    async def _play_audio(self):
-        self.audio_out_stream = await asyncio.to_thread(
-            pya.open,
-            format=FORMAT,
-            channels=CHANNELS,
-            rate=RECEIVE_SAMPLE_RATE,
-            output=True,
-        )
-        while not self._stop_event.is_set():
-            chunk = await self.audio_in_queue.get()
-            await asyncio.to_thread(self.audio_out_stream.write, chunk)
-
-    def _cleanup(self):
-        for stream in (self.audio_in_stream, self.audio_out_stream):
+    def _playback_loop(self):
+        """Owns the output stream: open → write → close, all on this thread."""
+        stream = None
+        try:
+            stream = pya.open(format=FORMAT, channels=CHANNELS,
+                              rate=RECEIVE_SAMPLE_RATE, output=True)
+            while not self._stop_flag.is_set():
+                try:
+                    chunk = self.play_q.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                try:
+                    stream.write(chunk)
+                except Exception:
+                    break
+        except Exception:
+            pass
+        finally:
             if stream is not None:
                 try:
+                    stream.stop_stream()
                     stream.close()
                 except Exception:
                     pass
-        self.audio_in_stream = None
-        self.audio_out_stream = None
+
+    def _cleanup(self):
+        # Tell the audio threads to stop, then wait for them to finish so no
+        # thread is still touching PortAudio (they close their own streams).
+        if self._stop_flag is not None:
+            self._stop_flag.set()
+        for t in (self._capture_thread, self._playback_thread):
+            if t is not None and t.is_alive():
+                t.join(timeout=2.0)
+        self._capture_thread = None
+        self._playback_thread = None
 
 
 # --- UI ---------------------------------------------------------------------
