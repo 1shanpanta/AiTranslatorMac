@@ -160,6 +160,12 @@ def build_config(play_audio: bool, target_language: str) -> types.LiveConnectCon
         # audio so we can render both side by side.
         input_audio_transcription=types.AudioTranscriptionConfig(),
         output_audio_transcription=types.AudioTranscriptionConfig(),
+        # Without this, audio-only Live sessions are capped at ~15 minutes and
+        # then terminate abruptly (captions "pause out of nowhere"). A
+        # sliding-window context compression lets the session run indefinitely.
+        context_window_compression=types.ContextWindowCompressionConfig(
+            sliding_window=types.SlidingWindow(),
+        ),
     )
 
 
