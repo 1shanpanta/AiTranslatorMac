@@ -144,7 +144,8 @@ def save_settings(settings: dict) -> None:
         pass
 
 
-def build_config(play_audio: bool, target_language: str) -> types.LiveConnectConfig:
+def build_config(play_audio: bool, target_language: str,
+                 resume_handle: str = None) -> types.LiveConnectConfig:
     """Live API config: speak audio in, get the target language back.
 
     We always request AUDIO (what the live-translate model is built for) plus
@@ -166,6 +167,10 @@ def build_config(play_audio: bool, target_language: str) -> types.LiveConnectCon
         context_window_compression=types.ContextWindowCompressionConfig(
             sliding_window=types.SlidingWindow(),
         ),
+        # Enable session resumption so a transient drop or the server's GoAway
+        # is recovered by reconnecting with the last handle, instead of the
+        # captions freezing. `handle` is None on the first connect.
+        session_resumption=types.SessionResumptionConfig(handle=resume_handle),
     )
 
 
@@ -249,45 +254,80 @@ class Translator:
         self._stop_flag = threading.Event()
         self.send_q = queue.Queue(maxsize=50)
         self.play_q = queue.Queue(maxsize=100)
+        self._resume_handle = None   # last session-resumption handle from server
+        self._conn_active = False    # True while a live session is usable
         self._emit("status", "Connecting…")
 
         client = genai.Client(
             http_options={"api_version": "v1beta"},
             api_key=self.api_key,
         )
-        config = build_config(self.play_audio, self.target_language)
 
+        # Audio I/O runs on dedicated OS threads that each own their PortAudio
+        # stream (open + read/write + close all on one thread). They start once
+        # and stay up across reconnects, so a dropped session never touches a
+        # stream mid-read — the race that segfaulted on stop.
+        self._capture_thread = threading.Thread(
+            target=self._capture_loop, daemon=True)
+        self._capture_thread.start()
+        if self.play_audio:
+            self._playback_thread = threading.Thread(
+                target=self._playback_loop, daemon=True)
+            self._playback_thread.start()
+
+        fails = 0
         try:
-            async with (
-                client.aio.live.connect(model=MODEL, config=config) as session,
-                asyncio.TaskGroup() as tg,
-            ):
-                self.session = session
+            # Reconnect loop: on a transient drop or the server's GoAway we come
+            # back around and resume the session with the stored handle, instead
+            # of the captions freezing.
+            while not self._stop_event.is_set():
+                config = build_config(self.play_audio, self.target_language,
+                                      self._resume_handle)
+                try:
+                    async with client.aio.live.connect(model=MODEL, config=config) as session:
+                        self.session = session
+                        self._conn_active = True
+                        fails = 0
+                        self._emit("status",
+                                   "Reconnecting…" if self._resume_handle else "Listening…")
 
-                # Audio I/O runs on dedicated OS threads that each own their
-                # PortAudio stream (open + read/write + close all on one
-                # thread). Nothing else ever touches a stream, so it's never
-                # closed mid-read — the race that segfaulted on stop.
-                self._capture_thread = threading.Thread(
-                    target=self._capture_loop, daemon=True)
-                self._capture_thread.start()
-                if self.play_audio:
-                    self._playback_thread = threading.Thread(
-                        target=self._playback_loop, daemon=True)
-                    self._playback_thread.start()
-
-                tg.create_task(self._send_realtime())
-                tg.create_task(self._receive())
-
-                self._emit("status", "Listening…")
-                await self._stop_event.wait()
-                raise asyncio.CancelledError()  # tear down the TaskGroup
-        except asyncio.CancelledError:
-            pass
-        except BaseExceptionGroup as eg:  # noqa: F821 (builtin on 3.11+)
-            self._emit("error", "; ".join(str(e) for e in eg.exceptions))
-        except Exception as exc:
-            self._emit("error", str(exc))
+                        send_task = asyncio.create_task(self._send_realtime())
+                        recv_task = asyncio.create_task(self._receive())
+                        stop_task = asyncio.create_task(self._stop_event.wait())
+                        try:
+                            # First to finish wins: recv/send end when the
+                            # session closes; stop_task ends on user stop.
+                            await asyncio.wait(
+                                {send_task, recv_task, stop_task},
+                                return_when=asyncio.FIRST_COMPLETED)
+                        finally:
+                            self._conn_active = False
+                            for t in (send_task, recv_task, stop_task):
+                                t.cancel()
+                            await asyncio.gather(send_task, recv_task, stop_task,
+                                                 return_exceptions=True)
+                    self.session = None
+                    if self._stop_event.is_set():
+                        break
+                    # Server ended the session (GoAway / drop): loop to resume.
+                    self._emit("status", "Reconnecting…")
+                    await asyncio.sleep(0.3)
+                except asyncio.CancelledError:
+                    break
+                except BaseExceptionGroup as eg:  # noqa: F821 (builtin on 3.11+)
+                    self.session = None
+                    fails += 1
+                    if self._stop_event.is_set() or fails > 6:
+                        self._emit("error", "; ".join(str(e) for e in eg.exceptions))
+                        break
+                    await asyncio.sleep(min(3.0, 0.4 * fails))
+                except Exception as exc:
+                    self.session = None
+                    fails += 1
+                    if self._stop_event.is_set() or fails > 6:
+                        self._emit("error", str(exc))
+                        break
+                    await asyncio.sleep(min(3.0, 0.4 * fails))
         finally:
             self._cleanup()
             self._emit("status", "Stopped")
@@ -354,20 +394,36 @@ class Translator:
         return np.clip(samples, -32768, 32767).astype("<i2").tobytes()
 
     async def _send_realtime(self):
-        while not self._stop_event.is_set():
+        while not self._stop_event.is_set() and self._conn_active:
             try:
                 data = await asyncio.to_thread(self.send_q.get, True, 0.2)
             except queue.Empty:
                 continue
-            if self.session is not None:
-                await self.session.send_realtime_input(
-                    audio=types.Blob(data=data,
-                                     mime_type="audio/pcm;rate=16000"))
+            if self.session is not None and self._conn_active:
+                try:
+                    await self.session.send_realtime_input(
+                        audio=types.Blob(data=data,
+                                         mime_type="audio/pcm;rate=16000"))
+                except Exception:
+                    # Session went away; let _run reconnect (with the handle).
+                    self._conn_active = False
+                    return
 
     async def _receive(self):
-        while not self._stop_event.is_set():
-            turn = self.session.receive()
-            async for response in turn:
+        try:
+            async for response in self.session.receive():
+                if self._stop_event.is_set():
+                    break
+                # Remember the resumption handle so we can reconnect after a
+                # drop/GoAway without losing the session.
+                sru = getattr(response, "session_resumption_update", None)
+                if sru is not None and getattr(sru, "new_handle", None):
+                    self._resume_handle = sru.new_handle
+                # Server signals it's about to close: stop sending, let _run
+                # reconnect and resume.
+                if getattr(response, "go_away", None) is not None:
+                    self._conn_active = False
+
                 sc = response.server_content
                 got_transcript = False
                 if sc is not None:
@@ -390,7 +446,11 @@ class Translator:
                         self.play_q.put_nowait(response.data)
                     except queue.Full:
                         pass
-
+        except Exception:
+            # Connection closed/errored; _run decides whether to resume.
+            pass
+        finally:
+            self._conn_active = False
             # Drop any audio buffered past an interruption.
             if self.play_q is not None:
                 while not self.play_q.empty():
